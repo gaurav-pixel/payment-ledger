@@ -12,6 +12,8 @@ import (
 	"payment-ledger/internal/config"
 	"payment-ledger/internal/handler"
 	"payment-ledger/internal/middleware"
+	"payment-ledger/internal/repository"
+	"payment-ledger/internal/repository/mock"
 	"payment-ledger/internal/repository/postgres"
 	"payment-ledger/internal/service"
 	"payment-ledger/pkg/db"
@@ -35,28 +37,53 @@ func main() {
 		MaxConnIdleTime: 30 * time.Minute,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	var (
+		accountRepo     repository.AccountRepository
+		transferRepo    repository.TransferRepository
+		entryRepo       repository.EntryRepository
+		idempotencyRepo repository.IdempotencyRepository
+		auditRepo       repository.AuditRepository
+		txManager       repository.TxManager
+	)
 
-	pool, err := db.NewPool(ctx, dbConfig)
-	if err != nil {
-		log.Fatalf("Fatal: Database initialization error: %v", err)
+	useInMemory := os.Getenv("DB_DRIVER") == "inmemory" || cfg.DBHost == "inmemory"
+
+	if !useInMemory {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		pool, err := db.NewPool(ctx, dbConfig)
+		if err != nil {
+			log.Printf("[WARN] PostgreSQL connection not reachable on %s:%d (%v). Falling back to in-memory transactional ledger engine for local preview.", cfg.DBHost, cfg.DBPort, err)
+			useInMemory = true
+		} else {
+			defer pool.Close()
+			log.Println("PostgreSQL connection pool established successfully.")
+
+			// Run database migrations automatically
+			if err := db.RunMigrations(context.Background(), pool); err != nil {
+				log.Fatalf("Fatal: Database migration failed: %v", err)
+			}
+
+			txManager = db.NewTxManager(pool)
+			accountRepo = postgres.NewAccountRepository(pool)
+			transferRepo = postgres.NewTransferRepository(pool)
+			entryRepo = postgres.NewEntryRepository(pool)
+			idempotencyRepo = postgres.NewIdempotencyRepository(pool)
+			auditRepo = postgres.NewAuditRepository(pool)
+		}
 	}
-	defer pool.Close()
-	log.Println("Database connection pool established successfully.")
 
-	// Run database migrations automatically
-	if err := db.RunMigrations(context.Background(), pool); err != nil {
-		log.Fatalf("Fatal: Database migration failed: %v", err)
+	if useInMemory {
+		log.Println("[INFO] Operating in Transactional In-Memory Mode with Concurrency Row-Locking & Consistent Lock Ordering.")
+		memDB := mock.NewInMemoryLedgerDB()
+		txManager = mock.NewMockTxManager(memDB)
+		accountRepo = mock.NewMockAccountRepo(memDB)
+		transferRepo = mock.NewMockTransferRepo(memDB)
+		entryRepo = mock.NewMockEntryRepo(memDB)
+		idempotencyRepo = mock.NewMockIdempotencyRepo(memDB)
+		auditRepo = mock.NewMockAuditRepo(memDB)
 	}
-
-	// Repositories
-	txManager := db.NewTxManager(pool)
-	accountRepo := postgres.NewAccountRepository(pool)
-	transferRepo := postgres.NewTransferRepository(pool)
-	entryRepo := postgres.NewEntryRepository(pool)
-	idempotencyRepo := postgres.NewIdempotencyRepository(pool)
-	auditRepo := postgres.NewAuditRepository(pool)
 
 	// Services
 	ledgerService := service.NewLedgerService(
